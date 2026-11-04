@@ -1,0 +1,13 @@
+{
+  "type": "preload-native",
+  "name": "Motion Blur",
+  "author": "RadiantByte / BedrockTools contributors",
+  "description": "Standalone camera motion blur for Minecraft Bedrock on Android.",
+  "version": "1.0.0",
+  "entry": "libMotionBlur.so",
+  "minecraft_versions": [
+    "1.26.60.*"
+  ],
+  "overwrite_files": [],
+  "overwrite_folders": []
+}

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "motionblur",
+  "version": "1.0.0",
+  "minecraft_versions": [
+    "1.26.60.*"
+  ],
+  "info": {
+    "name": "Motion Blur",
+    "author": "RadiantByte / BedrockTools contributors",
+    "description": "Standalone camera motion blur for Minecraft Bedrock on Android.",
+    "homepage_url": "https://github.com/LiteLDev/LeviLaunchroid",
+    "tags": [
+      "Visual",
+      "Graphics"
+    ]
+  },
+  "release_assets": {
+    "include": [
+      "*.levipack",
+      "*.so"
+    ],
+    "labels": {
+      "libMotionBlur.so": "Native library",
+      "motionblur.levipack": "LeviPack"
+    }
+  }
+}
