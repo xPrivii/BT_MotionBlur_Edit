@@ -8,7 +8,10 @@
       "opacity": 0.4,
       "resolutionScale": 0.5,
       "samples": 6,
-      "depthBlur": true
+      "depthBlur": true,
+      "handBlur": false,
+      "handIntensity": 0.5,
+      "handOpacity": 0.4
     }
   }
 }
