@@ -180,6 +180,22 @@ void main() {
 }
 )";
 
+constexpr const char* handCompositeShader = R"(#version 300 es
+precision mediump float;
+in vec2 uv;
+layout(location = 0) out vec4 result;
+uniform sampler2D scene;
+uniform sampler2D depthImage;
+uniform sampler2D blurred;
+uniform float opacity;
+void main() {
+    vec4 original = texture(scene, uv);
+    vec4 blur = texture(blurred, uv);
+    float mask = texture(depthImage, uv).r < 0.9999 ? 1.0 : 0.0;
+    result = vec4(mix(original.rgb, blur.rgb, opacity * blur.a * mask), original.a);
+}
+)";
+
 GLuint compile(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
     if (!shader) return 0;
@@ -356,6 +372,14 @@ struct MotionBlurModule::State {
     GLuint vao = 0;
     GLuint blurProgram = 0;
     GLuint compositeProgram = 0;
+    GLuint handProgram = 0;
+    GLint handOpacityUniform = -1;
+    bool handValid = false;
+    GLint handFramebuffer = 0;
+    glm::mat4 handInverse{1.0f};
+    glm::mat4 handPreviousProjection{1.0f};
+    glm::mat3 handRotation{1.0f};
+    float handElapsed = 0.0f;
     GLint inverseProjection = -1;
     GLint previousProjection = -1;
     GLint rotationDelta = -1;
@@ -392,13 +416,15 @@ struct MotionBlurModule::State {
         if (vao) glDeleteVertexArrays(1, &vao);
         if (blurProgram) glDeleteProgram(blurProgram);
         if (compositeProgram) glDeleteProgram(compositeProgram);
+        if (handProgram) glDeleteProgram(handProgram);
         forget();
     }
 
     void forget() {
         sceneTexture = depthTexture = blurTexture = 0;
         sceneFramebuffer = blurFramebuffer = vao = 0;
-        blurProgram = compositeProgram = 0;
+        blurProgram = compositeProgram = handProgram = 0;
+        handValid = false;
         width = height = blurWidth = blurHeight = 0;
         depthFormat = 0;
         failed = false;
@@ -411,11 +437,12 @@ struct MotionBlurModule::State {
 
     bool initialize() {
         if (failed) return false;
-        if (blurProgram && compositeProgram && vao) return true;
+        if (blurProgram && compositeProgram && handProgram && vao) return true;
         blurProgram = program(blurShader);
         compositeProgram = program(compositeShader);
+        handProgram = program(handCompositeShader);
         glGenVertexArrays(1, &vao);
-        if (!blurProgram || !compositeProgram || !vao) { failed = true; return false; }
+        if (!blurProgram || !compositeProgram || !handProgram || !vao) { failed = true; return false; }
         glUseProgram(blurProgram);
         glUniform1i(glGetUniformLocation(blurProgram, "scene"), 0);
         glUniform1i(glGetUniformLocation(blurProgram, "depthImage"), 1);
@@ -432,6 +459,11 @@ struct MotionBlurModule::State {
         glUniform1i(glGetUniformLocation(compositeProgram, "scene"), 0);
         glUniform1i(glGetUniformLocation(compositeProgram, "blurred"), 2);
         opacity = glGetUniformLocation(compositeProgram, "opacity");
+        glUseProgram(handProgram);
+        glUniform1i(glGetUniformLocation(handProgram, "scene"), 0);
+        glUniform1i(glGetUniformLocation(handProgram, "depthImage"), 1);
+        glUniform1i(glGetUniformLocation(handProgram, "blurred"), 2);
+        handOpacityUniform = glGetUniformLocation(handProgram, "opacity");
         return glGetError() == GL_NO_ERROR;
     }
 
@@ -477,7 +509,7 @@ struct MotionBlurModule::State {
 };
 
 MotionBlurModule::MotionBlurModule()
-    : Module("Motion Blur", "Blurs camera motion in the world while keeping the hand and HUD sharp."), m_state(std::make_unique<State>()) {
+    : Module("Motion Blur", "Blurs camera motion in the world. Optionally blurs the held hand/item too."), m_state(std::make_unique<State>()) {
     instance = this;
 }
 
@@ -563,6 +595,10 @@ void MotionBlurModule::captureWorld(void* renderer) {
 void MotionBlurModule::onFrame() {
     auto& state = *m_state;
     if (eglGetCurrentContext() != state.context || eglGetCurrentSurface(EGL_DRAW) != state.surface) return;
+    if (state.handValid) {
+        state.handValid = false;
+        applyHandBlur();
+    }
     state.sceneStarted = false;
     state.processed = false;
     state.worldFramebuffer = -1;
@@ -665,7 +701,8 @@ void MotionBlurModule::beforeClear(unsigned int mask) {
     GLint depthBits = 0, stencilBits = 0;
     glGetIntegerv(GL_DEPTH_BITS, &depthBits);
     glGetIntegerv(GL_STENCIL_BITS, &stencilBits);
-    GLenum depthFormat = !useDepth || !nativeProjection || depthBits == 0 ? 0 : depthBits <= 16 ? GL_DEPTH_COMPONENT16 :
+    const bool handBlurOn = m_handBlur.load(std::memory_order_relaxed);
+    GLenum depthFormat = (!useDepth && !handBlurOn) || !nativeProjection || depthBits == 0 ? 0 : depthBits <= 16 ? GL_DEPTH_COMPONENT16 :
         depthBits <= 24 ? (stencilBits ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT24) :
         (stencilBits ? GL_DEPTH32F_STENCIL8 : GL_DEPTH_COMPONENT32F);
     if (depthFormat == state.rejectedDepthFormat) depthFormat = 0;
@@ -694,6 +731,12 @@ void MotionBlurModule::beforeClear(unsigned int mask) {
     const glm::mat3 previousView = glm::mat3_cast(glm::conjugate(previous.orientation));
     const glm::mat3 rotationDelta = previousView * glm::mat3_cast(camera.orientation);
     const glm::vec3 translation = previousView * (camera.position - previous.position);
+    state.handValid = handBlurOn && depthCopied;
+    state.handFramebuffer = framebuffer;
+    state.handInverse = glm::inverse(projection);
+    state.handPreviousProjection = previousProjection;
+    state.handRotation = rotationDelta;
+    state.handElapsed = elapsed;
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, state.blurFramebuffer);
     glViewport(0, 0, state.blurWidth, state.blurHeight);
     glUseProgram(state.blurProgram);
@@ -707,7 +750,7 @@ void MotionBlurModule::beforeClear(unsigned int mask) {
     glUniform2f(state.sceneSize, static_cast<float>(width), static_cast<float>(height));
     glUniform1f(state.exposure, intensity * blendBoost * 0.5f * std::clamp(1.0f / (60.0f * elapsed), 0.25f, 4.0f));
     glUniform1f(state.maxStreak, 24.0f * std::max(1.0f, intensity) * blendBoost);
-    glUniform1f(state.depthEnabled, depthCopied ? 1.0f : 0.0f);
+    glUniform1f(state.depthEnabled, depthCopied && useDepth ? 1.0f : 0.0f);
     glUniform1i(state.samples, m_samples.load(std::memory_order_relaxed));
     glDrawArrays(GL_TRIANGLES, 0, 3);
     if (glGetError() != GL_NO_ERROR) return;
@@ -719,11 +762,69 @@ void MotionBlurModule::beforeClear(unsigned int mask) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
+void MotionBlurModule::applyHandBlur() {
+    auto& state = *m_state;
+    if (!m_active.load(std::memory_order_acquire) || !m_handBlur.load(std::memory_order_relaxed)) return;
+    if (!state.blurProgram || !state.handProgram || !state.sceneFramebuffer || !state.blurFramebuffer || !state.depthTexture || state.width <= 0) return;
+    const float intensity = m_handIntensity.load(std::memory_order_relaxed);
+    const float opacityValue = m_handOpacity.load(std::memory_order_relaxed);
+    if (intensity <= 0.0f || opacityValue <= 0.0f) return;
+    if (glGetError() != GL_NO_ERROR) return;
+    const float blendBoost = std::max(1.0f, opacityValue);
+    processing = true;
+    struct ProcessingGuard { ~ProcessingGuard() { processing = false; } } processingGuard;
+    GlState saved;
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    saved.prepare(state.vao);
+    const GLint framebuffer = state.handFramebuffer;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    GLint readBuffer = 0;
+    glGetIntegerv(GL_READ_BUFFER, &readBuffer);
+    glReadBuffer(framebuffer ? GL_COLOR_ATTACHMENT0 : GL_BACK);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, state.sceneFramebuffer);
+    glBlitFramebuffer(0, 0, state.width, state.height, 0, 0, state.width, state.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    const bool colorCopied = glGetError() == GL_NO_ERROR;
+    bool depthCopied = false;
+    if (colorCopied) {
+        glBlitFramebuffer(0, 0, state.width, state.height, 0, 0, state.width, state.height, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        depthCopied = glGetError() == GL_NO_ERROR;
+    }
+    glReadBuffer(readBuffer);
+    if (!colorCopied || !depthCopied) return;
+    // Blur pass: rotation-only reprojection (the hand is attached to the camera).
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, state.blurFramebuffer);
+    glViewport(0, 0, state.blurWidth, state.blurHeight);
+    glUseProgram(state.blurProgram);
+    bindTexture(0, state.sceneTexture);
+    bindTexture(1, state.depthTexture);
+    glUniformMatrix4fv(state.inverseProjection, 1, GL_FALSE, glm::value_ptr(state.handInverse));
+    glUniformMatrix4fv(state.previousProjection, 1, GL_FALSE, glm::value_ptr(state.handPreviousProjection));
+    glUniformMatrix3fv(state.rotationDelta, 1, GL_FALSE, glm::value_ptr(state.handRotation));
+    glUniform3f(state.translationDelta, 0.0f, 0.0f, 0.0f);
+    glUniform2f(state.sceneSize, static_cast<float>(state.width), static_cast<float>(state.height));
+    glUniform1f(state.exposure, intensity * blendBoost * 0.5f * std::clamp(1.0f / (60.0f * state.handElapsed), 0.25f, 4.0f));
+    glUniform1f(state.maxStreak, 24.0f * std::max(1.0f, intensity) * blendBoost);
+    glUniform1f(state.depthEnabled, 0.0f);
+    glUniform1i(state.samples, m_samples.load(std::memory_order_relaxed));
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (glGetError() != GL_NO_ERROR) return;
+    // Composite only where the hand was drawn (depth < 1 after the pre-hand depth clear).
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
+    glViewport(0, 0, state.width, state.height);
+    glUseProgram(state.handProgram);
+    bindTexture(0, state.sceneTexture);
+    bindTexture(1, state.depthTexture);
+    bindTexture(2, state.blurTexture);
+    glUniform1f(state.handOpacityUniform, std::min(opacityValue, 1.0f));
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
 void MotionBlurModule::onMenuRegistered() {
     using namespace pl::modmenu;
     ConfigSchemaBuilder schema;
     schema.defaultCategory("blur")
         .category("blur", "Motion Blur", "World motion and appearance")
+        .category("hand", "Hand Blur", "Blur the held hand and item")
         .category("quality", "Quality", "Balance sharpness and performance");
     auto slider = [&](const char* key, const char* title, const char* category,
                       ConfigControlTypeV2 type, const char* low, const char* high, const char* step,
@@ -754,6 +855,18 @@ void MotionBlurModule::onMenuRegistered() {
     depth.category = "blur";
     depth.type = ConfigControlTypeV2::Toggle;
     schema.node(std::move(depth));
+    ConfigNodeV2 hand;
+    hand.id = "handBlur";
+    hand.key = "handBlur";
+    hand.title = "Hand Blur";
+    hand.description = "Also blur the held hand/item while the camera moves. Needs the world blur to be active.";
+    hand.category = "hand";
+    hand.type = ConfigControlTypeV2::Toggle;
+    schema.node(std::move(hand));
+    slider("handIntensity", "Hand Strength", "hand", ConfigControlTypeV2::SliderFloat, "0", "5", "0.05",
+        "Amount of blur applied to the hand.");
+    slider("handOpacity", "Hand Blend", "hand", ConfigControlTypeV2::SliderFloat, "0", "2", "0.05",
+        "How strongly the blurred hand is blended in.");
     pl::modmenu::setConfigSchemaJson(moduleId, schema.toJson());
 }
 
@@ -764,6 +877,9 @@ void MotionBlurModule::loadConfig(const nlohmann::json& j) {
     m_resolutionScale.store(setting(j.value("resolutionScale", m_resolutionScale.load()), 0.5f, 0.5f, 1.0f));
     m_samples.store(std::clamp(j.value("samples", m_samples.load()), 4, 8));
     m_depthBlur.store(j.value("depthBlur", m_depthBlur.load()));
+    m_handBlur.store(j.value("handBlur", m_handBlur.load()));
+    m_handIntensity.store(setting(j.value("handIntensity", m_handIntensity.load()), 0.5f, 0.0f, 5.0f));
+    m_handOpacity.store(setting(j.value("handOpacity", m_handOpacity.load()), 0.4f, 0.0f, 2.0f));
 }
 
 void MotionBlurModule::saveConfig(nlohmann::json& j) {
@@ -773,4 +889,7 @@ void MotionBlurModule::saveConfig(nlohmann::json& j) {
     j["resolutionScale"] = m_resolutionScale.load();
     j["samples"] = m_samples.load();
     j["depthBlur"] = m_depthBlur.load();
+    j["handBlur"] = m_handBlur.load();
+    j["handIntensity"] = m_handIntensity.load();
+    j["handOpacity"] = m_handOpacity.load();
 }

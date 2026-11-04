@@ -18,6 +18,7 @@ public:
     void captureCamera(void* camera, void* player);
     void captureWorld(void* renderer);
     void beforeClear(unsigned int mask);
+    void applyHandBlur();
 
 private:
     struct State;
@@ -28,6 +29,9 @@ private:
     std::atomic<float> m_resolutionScale{0.5f};
     std::atomic<int> m_samples{6};
     std::atomic_bool m_depthBlur{true};
+    std::atomic_bool m_handBlur{false};
+    std::atomic<float> m_handIntensity{0.5f};
+    std::atomic<float> m_handOpacity{0.4f};
 };
 
 void MotionBlurCaptureCamera(void* camera, void* player);
