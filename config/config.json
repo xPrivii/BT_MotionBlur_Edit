@@ -1,0 +1,14 @@
+{
+  "Modules": {
+    "Motion Blur": {
+      "keybind": 0,
+      "keybindActive": true,
+      "masterEnabled": false,
+      "intensity": 0.9,
+      "opacity": 0.4,
+      "resolutionScale": 0.5,
+      "samples": 6,
+      "depthBlur": true
+    }
+  }
+}
